@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"osint.bot/internal/bot"
@@ -35,7 +36,7 @@ func Run() error {
 	}
 
 	mtp := mtproto.NewPool()
-	mtp.Start(ctx, cfg.AppID, cfg.AppHash, 3)
+	mtp.Start(ctx, cfg.AppID, cfg.AppHash, cfg.PoolSize)
 
 	handler := bot.NewHandler(cfg, botAPI, redisStore, mtp)
 
@@ -48,6 +49,16 @@ func Run() error {
 		select {
 		case <-ctx.Done():
 			log.Printf("shutdown signal received")
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			handler.Wait(30 * time.Second)
+			mtp.Close()
+			if redisStore != nil {
+				if err := redisStore.Close(); err != nil {
+					log.Printf("redis close failed: %v", err)
+				}
+			}
+			_ = shutdownCtx
 			return nil
 		case upd, ok := <-updates:
 			if !ok {
