@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -23,22 +24,34 @@ import (
 type Handler struct {
 	cfg      *config.Config
 	bot      *tgbotapi.BotAPI
-	store    *storage.RedisStore
+	store    storage.KVStore
 	state    *UserStateStore
 	mtp      *mtproto.Pool
 	search   *search.Service
 	geocoder *maps.Geocoder
 
-	wg         sync.WaitGroup
-	semMu      sync.Mutex
-	searchSems map[int64]*semaphore.Weighted
+	wg sync.WaitGroup
+
+	semMu         sync.Mutex
+	searchSems    map[int64]*semaphore.Weighted
+	cancelMu      sync.Mutex
+	searchCancel  map[int64]context.CancelFunc
+	rateMu        sync.Mutex
+	lastSearchRun map[int64]time.Time
 }
 
-func NewHandler(cfg *config.Config, botAPI *tgbotapi.BotAPI, redis *storage.RedisStore, mtp *mtproto.Pool) *Handler {
+func NewHandler(cfg *config.Config, botAPI *tgbotapi.BotAPI, redis storage.KVStore, mtp *mtproto.Pool) *Handler {
 	httpClient := search.NewHTTPClient(cfg.ProxyURL)
 	searchSvc := search.NewService(
 		redis,
-		time.Hour,
+		search.Options{
+			CacheTTL:           time.Duration(cfg.CacheTTL) * time.Second,
+			SourceTimeout:      cfg.SourceTimeout,
+			SourceRetryCount:   cfg.SourceRetryCount,
+			SourceRetryBackoff: cfg.SourceRetryBackoff,
+			SourceMaxParallel:  cfg.SourceMaxParallel,
+			CachePrefix:        "osint",
+		},
 		search.NewTelegramMTSource(mtp),
 		search.NewLeakCheckSource(httpClient, cfg.LeakCheckKey),
 		search.NewHIBPSource(httpClient, cfg.HIBPAPIKey),
@@ -47,14 +60,16 @@ func NewHandler(cfg *config.Config, botAPI *tgbotapi.BotAPI, redis *storage.Redi
 		search.NewHoleheSource(httpClient),
 	)
 	return &Handler{
-		cfg:        cfg,
-		bot:        botAPI,
-		store:      redis,
-		state:      NewUserStateStore(),
-		mtp:        mtp,
-		search:     searchSvc,
-		geocoder:   maps.NewGeocoder(),
-		searchSems: make(map[int64]*semaphore.Weighted),
+		cfg:           cfg,
+		bot:           botAPI,
+		store:         redis,
+		state:         NewUserStateStore(),
+		mtp:           mtp,
+		search:        searchSvc,
+		geocoder:      maps.NewGeocoder(),
+		searchSems:    make(map[int64]*semaphore.Weighted),
+		searchCancel:  make(map[int64]context.CancelFunc),
+		lastSearchRun: make(map[int64]time.Time),
 	}
 }
 
@@ -116,7 +131,7 @@ func (h *Handler) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 	}
 	switch msg.Command() {
 	case "start", "help":
-		h.reply(msg.Chat.ID, "OSINT bot online. Команды: /menu /search /stats /status /export /clear")
+		h.reply(msg.Chat.ID, "OSINT bot online. Команды: /menu /search /stats /status /export /clear /cancel")
 		h.sendMainMenu(msg.Chat.ID)
 	case "menu":
 		h.sendMainMenu(msg.Chat.ID)
@@ -130,6 +145,9 @@ func (h *Handler) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 	case "clear":
 		h.state.ClearCache(msg.From.ID)
 		h.reply(msg.Chat.ID, "🗑 Кеш очищен")
+	case "cancel":
+		h.cancelSearch(msg.From.ID)
+		h.reply(msg.Chat.ID, "⛔ Текущий поиск отменён")
 	case "export":
 		h.sendExportMenu(msg.Chat.ID)
 	default:
@@ -200,16 +218,31 @@ func (h *Handler) handleStatefulInput(ctx context.Context, chatID, userID int64,
 }
 
 func (h *Handler) runSearch(ctx context.Context, chatID, userID int64, query string, qType model.QueryType) {
-	if strings.TrimSpace(query) == "" {
-		h.reply(chatID, "Пустой запрос")
+	normalized, err := validateQuery(query)
+	if err != nil {
+		h.reply(chatID, "Некорректный запрос: "+err.Error())
 		return
 	}
+	if !h.allowByRateLimit(userID) {
+		h.reply(chatID, fmt.Sprintf("⏳ Слишком часто. Повторите через %s", h.cfg.UserRateLimit))
+		return
+	}
+
 	sem := h.userSearchSemaphore(userID)
 	if err := sem.Acquire(ctx, 1); err != nil {
 		h.reply(chatID, "Поиск отменен")
 		return
 	}
 	defer sem.Release(1)
+
+	searchCtx, cancel := context.WithTimeout(ctx, h.cfg.SearchTimeout)
+	h.setCancel(userID, cancel)
+	defer func() {
+		h.clearCancel(userID)
+		cancel()
+	}()
+
+	h.reply(chatID, "🔎 Ищу… Это может занять до нескольких секунд.")
 
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -218,13 +251,70 @@ func (h *Handler) runSearch(ctx context.Context, chatID, userID int64, query str
 		}
 	}()
 
-	log.Printf("search request: user=%d query=%q type=%s", userID, query, qType)
-	res := h.search.Search(ctx, query, qType)
+	log.Printf("level=info msg=search_request user=%d query=%q type=%s", userID, normalized, qType)
+	res := h.search.Search(searchCtx, normalized, qType)
+	if err := searchCtx.Err(); err != nil {
+		h.reply(chatID, "⏱ Поиск прерван по таймауту или отмене")
+		return
+	}
+
 	h.state.SetCache(userID, res)
 	chunks := formatter.RenderResult(res)
 	for _, chunk := range chunks {
 		h.reply(chatID, chunk)
 	}
+}
+
+func validateQuery(query string) (string, error) {
+	q := search.NormalizeQuery(query)
+	if q == "" {
+		return "", fmt.Errorf("пустая строка")
+	}
+	if len(q) > 256 {
+		return "", fmt.Errorf("слишком длинный запрос (макс. 256 символов)")
+	}
+	if regexp.MustCompile(`[\x00-\x08\x0B\x0C\x0E-\x1F]`).MatchString(q) {
+		return "", fmt.Errorf("запрос содержит недопустимые символы")
+	}
+	return q, nil
+}
+
+func (h *Handler) allowByRateLimit(userID int64) bool {
+	h.rateMu.Lock()
+	defer h.rateMu.Unlock()
+	if h.cfg.UserRateLimit <= 0 {
+		return true
+	}
+	last := h.lastSearchRun[userID]
+	if !last.IsZero() && time.Since(last) < h.cfg.UserRateLimit {
+		return false
+	}
+	h.lastSearchRun[userID] = time.Now()
+	return true
+}
+
+func (h *Handler) cancelSearch(userID int64) {
+	h.cancelMu.Lock()
+	defer h.cancelMu.Unlock()
+	if cancel, ok := h.searchCancel[userID]; ok {
+		cancel()
+		delete(h.searchCancel, userID)
+	}
+}
+
+func (h *Handler) setCancel(userID int64, cancel context.CancelFunc) {
+	h.cancelMu.Lock()
+	defer h.cancelMu.Unlock()
+	if prev, ok := h.searchCancel[userID]; ok {
+		prev()
+	}
+	h.searchCancel[userID] = cancel
+}
+
+func (h *Handler) clearCancel(userID int64) {
+	h.cancelMu.Lock()
+	defer h.cancelMu.Unlock()
+	delete(h.searchCancel, userID)
 }
 
 func (h *Handler) showStats(ctx context.Context, chatID int64) {
@@ -369,9 +459,6 @@ func (h *Handler) answerCallback(callbackID, text string) {
 
 func (h *Handler) reply(chatID int64, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
-	if len(text) > formatter.TelegramChunkSize {
-		msg.Text = text[:formatter.TelegramChunkSize]
-	}
 	if _, err := h.bot.Send(msg); err != nil {
 		log.Printf("send reply failed: %v", err)
 	}
@@ -392,7 +479,7 @@ func (h *Handler) userSearchSemaphore(userID int64) *semaphore.Weighted {
 	if s, ok := h.searchSems[userID]; ok {
 		return s
 	}
-	s := semaphore.NewWeighted(5)
+	s := semaphore.NewWeighted(1)
 	h.searchSems[userID] = s
 	return s
 }

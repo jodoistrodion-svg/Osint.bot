@@ -29,7 +29,8 @@ func Run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	redisStore := storage.NewRedisStore(cfg.RedisAddr, cfg.RedisPassword)
+	var redisStore storage.KVStore
+	redisStore = storage.NewRedisStore(cfg.RedisAddr, cfg.RedisPassword)
 	if err := redisStore.Ping(ctx); err != nil {
 		log.Printf("redis unavailable, cache disabled: %v", err)
 		redisStore = nil
@@ -49,8 +50,6 @@ func Run() error {
 		select {
 		case <-ctx.Done():
 			log.Printf("shutdown signal received")
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
 			handler.Wait(30 * time.Second)
 			mtp.Close()
 			if redisStore != nil {
@@ -58,7 +57,6 @@ func Run() error {
 					log.Printf("redis close failed: %v", err)
 				}
 			}
-			_ = shutdownCtx
 			return nil
 		case upd, ok := <-updates:
 			if !ok {
