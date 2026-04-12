@@ -38,6 +38,9 @@ func (r *RedisStore) DBSize(ctx context.Context) (int64, error) {
 }
 
 func (r *RedisStore) SetJSON(ctx context.Context, key string, value any, ttl time.Duration) error {
+	if r == nil || r.client == nil {
+		return fmt.Errorf("redis is not configured")
+	}
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return err
@@ -46,9 +49,19 @@ func (r *RedisStore) SetJSON(ctx context.Context, key string, value any, ttl tim
 }
 
 func (r *RedisStore) GetJSON(ctx context.Context, key string, out any) error {
+	if r == nil || r.client == nil {
+		return fmt.Errorf("redis is not configured")
+	}
 	data, err := r.client.Get(ctx, key).Bytes()
 	if err != nil {
 		return err
 	}
 	return json.Unmarshal(data, out)
+}
+
+func (r *RedisStore) Close() error {
+	if r == nil || r.client == nil {
+		return nil
+	}
+	return r.client.Close()
 }

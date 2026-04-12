@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"golang.org/x/sync/semaphore"
 	"osint.bot/internal/config"
 	"osint.bot/internal/export"
 	"osint.bot/internal/formatter"
@@ -25,36 +28,70 @@ type Handler struct {
 	mtp      *mtproto.Pool
 	search   *search.Service
 	geocoder *maps.Geocoder
+
+	wg         sync.WaitGroup
+	semMu      sync.Mutex
+	searchSems map[int64]*semaphore.Weighted
 }
 
 func NewHandler(cfg *config.Config, botAPI *tgbotapi.BotAPI, redis *storage.RedisStore, mtp *mtproto.Pool) *Handler {
+	httpClient := search.NewHTTPClient(cfg.ProxyURL)
 	searchSvc := search.NewService(
-		search.NewStaticSource("local_index"),
-		search.NewStaticSource("social_graph"),
-		search.NewStaticSource("leaks_archive"),
-		search.NewStaticSource("ads_monitor"),
+		redis,
+		time.Hour,
+		search.NewTelegramMTSource(mtp),
+		search.NewLeakCheckSource(httpClient, cfg.LeakCheckKey),
+		search.NewHIBPSource(httpClient, cfg.HIBPAPIKey),
+		search.NewPsbdmpSource(httpClient),
+		search.NewScyllaSource(httpClient),
+		search.NewHoleheSource(httpClient),
 	)
 	return &Handler{
-		cfg:      cfg,
-		bot:      botAPI,
-		store:    redis,
-		state:    NewUserStateStore(),
-		mtp:      mtp,
-		search:   searchSvc,
-		geocoder: maps.NewGeocoder(),
+		cfg:        cfg,
+		bot:        botAPI,
+		store:      redis,
+		state:      NewUserStateStore(),
+		mtp:        mtp,
+		search:     searchSvc,
+		geocoder:   maps.NewGeocoder(),
+		searchSems: make(map[int64]*semaphore.Weighted),
 	}
 }
 
 func (h *Handler) ProcessUpdate(ctx context.Context, upd tgbotapi.Update) {
 	if upd.CallbackQuery != nil {
-		h.handleCallback(ctx, upd.CallbackQuery)
+		h.wg.Add(1)
+		go func() {
+			defer h.wg.Done()
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("panic recovered in callback handler: %v", rec)
+				}
+			}()
+			h.handleCallback(ctx, upd.CallbackQuery)
+		}()
 		return
 	}
 	if upd.Message == nil {
 		return
 	}
 
-	msg := upd.Message
+	h.wg.Add(1)
+	go func(msg *tgbotapi.Message) {
+		defer h.wg.Done()
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("panic recovered in message handler: %v", rec)
+			}
+		}()
+		h.handleMessage(ctx, msg)
+	}(upd.Message)
+}
+
+func (h *Handler) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
+	if msg == nil || msg.From == nil {
+		return
+	}
 	if !h.isAdmin(msg.From.ID) {
 		h.reply(msg.Chat.ID, "⛔ Доступ запрещен")
 		return
@@ -74,9 +111,12 @@ func (h *Handler) ProcessUpdate(ctx context.Context, upd tgbotapi.Update) {
 }
 
 func (h *Handler) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
+	if msg == nil || msg.From == nil {
+		return
+	}
 	switch msg.Command() {
 	case "start", "help":
-		h.reply(msg.Chat.ID, "OSINT bot online. Команды: /menu /search /stats /export /clear")
+		h.reply(msg.Chat.ID, "OSINT bot online. Команды: /menu /search /stats /status /export /clear")
 		h.sendMainMenu(msg.Chat.ID)
 	case "menu":
 		h.sendMainMenu(msg.Chat.ID)
@@ -85,6 +125,8 @@ func (h *Handler) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 		h.reply(msg.Chat.ID, "Введите запрос (телефон/email/FIO/address/car).")
 	case "stats":
 		h.showStats(ctx, msg.Chat.ID)
+	case "status":
+		h.showStatus(ctx, msg.Chat.ID)
 	case "clear":
 		h.state.ClearCache(msg.From.ID)
 		h.reply(msg.Chat.ID, "🗑 Кеш очищен")
@@ -162,6 +204,21 @@ func (h *Handler) runSearch(ctx context.Context, chatID, userID int64, query str
 		h.reply(chatID, "Пустой запрос")
 		return
 	}
+	sem := h.userSearchSemaphore(userID)
+	if err := sem.Acquire(ctx, 1); err != nil {
+		h.reply(chatID, "Поиск отменен")
+		return
+	}
+	defer sem.Release(1)
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("panic recovered in search for user=%d: %v", userID, rec)
+			h.reply(chatID, "Произошла внутренняя ошибка поиска")
+		}
+	}()
+
+	log.Printf("search request: user=%d query=%q type=%s", userID, query, qType)
 	res := h.search.Search(ctx, query, qType)
 	h.state.SetCache(userID, res)
 	chunks := formatter.RenderResult(res)
@@ -183,6 +240,23 @@ func (h *Handler) showStats(ctx context.Context, chatID int64) {
 	}
 
 	msg := fmt.Sprintf("📊 Статистика\nRedis keys: %d\nMTProto ready: %d", keys, h.mtp.ReadyCount())
+	h.reply(chatID, msg)
+}
+
+func (h *Handler) showStatus(ctx context.Context, chatID int64) {
+	redisStatus := "disabled"
+	keys := int64(0)
+	if h.store != nil {
+		if err := h.store.Ping(ctx); err != nil {
+			redisStatus = "error: " + err.Error()
+		} else {
+			redisStatus = "ok"
+			if c, err := h.store.DBSize(ctx); err == nil {
+				keys = c
+			}
+		}
+	}
+	msg := fmt.Sprintf("🩺 Status\nVersion: %s\nMTProto sessions: %d\nRedis: %s\nRedis keys: %d", h.cfg.BotVersion, h.mtp.ReadyCount(), redisStatus, keys)
 	h.reply(chatID, msg)
 }
 
@@ -299,15 +373,39 @@ func (h *Handler) reply(chatID int64, text string) {
 		msg.Text = text[:formatter.TelegramChunkSize]
 	}
 	if _, err := h.bot.Send(msg); err != nil {
-		log.Printf("send message failed: %v", err)
+		log.Printf("send reply failed: %v", err)
 	}
 }
 
 func (h *Handler) isAdmin(userID int64) bool {
-	for _, adminID := range h.cfg.AdminIDs {
-		if adminID == userID {
+	for _, id := range h.cfg.AdminIDs {
+		if id == userID {
 			return true
 		}
 	}
-	return false
+	return len(h.cfg.AdminIDs) == 0
+}
+
+func (h *Handler) userSearchSemaphore(userID int64) *semaphore.Weighted {
+	h.semMu.Lock()
+	defer h.semMu.Unlock()
+	if s, ok := h.searchSems[userID]; ok {
+		return s
+	}
+	s := semaphore.NewWeighted(5)
+	h.searchSems[userID] = s
+	return s
+}
+
+func (h *Handler) Wait(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		h.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		log.Printf("handler wait timeout reached: %s", timeout)
+	}
 }

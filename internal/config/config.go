@@ -18,6 +18,11 @@ type Config struct {
 	RedisAddr     string
 	RedisPassword string
 	CacheTTL      int
+	ProxyURL      string
+	PoolSize      int
+	BotVersion    string
+	HIBPAPIKey    string
+	LeakCheckKey  string
 }
 
 func Load() (*Config, error) {
@@ -30,6 +35,11 @@ func Load() (*Config, error) {
 		RedisAddr:     defaultString(os.Getenv("REDIS_ADDR"), "localhost:6379"),
 		RedisPassword: os.Getenv("REDIS_PASSWORD"),
 		CacheTTL:      defaultInt(os.Getenv("CACHE_TTL"), 3600),
+		ProxyURL:      strings.TrimSpace(os.Getenv("PROXY_URL")),
+		PoolSize:      defaultInt(os.Getenv("MTPROTO_POOL_SIZE"), 3),
+		BotVersion:    defaultString(os.Getenv("BOT_VERSION"), "1.0.0"),
+		HIBPAPIKey:    strings.TrimSpace(os.Getenv("HIBP_API_KEY")),
+		LeakCheckKey:  strings.TrimSpace(os.Getenv("LEAKCHECK_API_KEY")),
 	}
 	cfg.AppID, _ = strconv.Atoi(strings.TrimSpace(os.Getenv("APP_ID")))
 
