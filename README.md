@@ -1,19 +1,40 @@
 # Osint.bot
 
-Репозиторий приведен к базовой модульной архитектуре Go:
+Репозиторий оставлен компактным (ядро в 5–6 ключевых модулях), но функционал бота расширен:
 
 - `cmd/osintbot` — точка входа.
-- `internal/app` — сборка приложения и lifecycle.
-- `internal/config` — загрузка/валидация ENV.
-- `internal/bot` — обработчики Telegram и потокобезопасное состояние.
-- `internal/storage` — Redis-слой.
-- `internal/mtproto` — старт/учет пула MTProto клиентов.
-- `internal/model` — модели домена.
-- `legacy` — архив исходного монолитного файла.
+- `internal/app` — lifecycle приложения.
+- `internal/bot` — Telegram handlers, callback-меню, сценарии поиска/экспорта/карт.
+- `internal/search` — универсальный поиск и интеграции с внешними источниками (через плагины `Source`).
+- `internal/formatter` — форматирование и разбиение длинных ответов для Telegram.
+- `internal/export` — выгрузка результатов в JSON/CSV.
+- `internal/maps` — геокодинг адреса и генерация map-link.
+- `internal/config`, `internal/storage`, `internal/mtproto`, `internal/model` — инфраструктурные модули.
+
+## Что добавлено
+
+1. **Реальный универсальный поиск**
+   - Авто-детект типа запроса: `phone/email/FIO/address/car`.
+   - Явный тип поиска через callback-меню.
+   - Параллельный опрос нескольких источников (`local_index`, `social_graph`, `leaks_archive`, `ads_monitor`).
+
+2. **Тяжёлая callback-логика меню**
+   - Главное меню: поиск / экспорт / карта.
+   - Подменю типов поиска.
+   - Подменю экспорта.
+
+3. **Форматирование больших ответов**
+   - Сводка по запросу + источники + поля.
+   - Автоматическое разбиение длинного текста на Telegram-safe chunk'и.
+
+4. **Экспорт и карты**
+   - Экспорт последнего результата пользователя в `JSON` и `CSV`.
+   - Поиск адреса через Nominatim + ссылка на OpenStreetMap.
 
 ## Запуск
 
 ```bash
-go mod tidy
 go run ./cmd/osintbot
 ```
+
+> Для полного локального билда/тестов нужны зависимости из `go.mod` (в CI/среде без доступа к `proxy.golang.org` команды `go mod tidy`/`go test` могут падать).
