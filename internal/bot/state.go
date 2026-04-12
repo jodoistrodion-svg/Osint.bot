@@ -41,6 +41,13 @@ func (s *UserStateStore) SetCache(userID int64, result *model.SearchResult) {
 	s.cache[userID] = result
 }
 
+func (s *UserStateStore) GetCache(userID int64) (*model.SearchResult, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	res, ok := s.cache[userID]
+	return res, ok
+}
+
 func (s *UserStateStore) ClearCache(userID int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
