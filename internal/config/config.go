@@ -31,6 +31,7 @@ type Config struct {
 	SourceRetryBackoff time.Duration
 	SourceMaxParallel  int64
 	UserRateLimit      time.Duration
+	UpdateMaxParallel  int64
 }
 
 func Load() (*Config, error) {
@@ -55,6 +56,7 @@ func Load() (*Config, error) {
 		SourceRetryBackoff: time.Duration(defaultInt(os.Getenv("SOURCE_RETRY_BACKOFF_MS"), 350)) * time.Millisecond,
 		SourceMaxParallel:  int64(defaultInt(os.Getenv("SOURCE_MAX_PARALLEL"), 6)),
 		UserRateLimit:      time.Duration(defaultInt(os.Getenv("USER_RATE_LIMIT_MS"), 1200)) * time.Millisecond,
+		UpdateMaxParallel:  int64(defaultInt(os.Getenv("UPDATE_MAX_PARALLEL"), 64)),
 	}
 
 	appIDRaw := strings.TrimSpace(os.Getenv("APP_ID"))
@@ -93,8 +95,14 @@ func Load() (*Config, error) {
 	if cfg.SourceMaxParallel <= 0 {
 		return nil, fmt.Errorf("SOURCE_MAX_PARALLEL must be > 0")
 	}
+	if cfg.UpdateMaxParallel <= 0 {
+		return nil, fmt.Errorf("UPDATE_MAX_PARALLEL must be > 0")
+	}
 	if cfg.AppID > 0 && cfg.AppHash == "" {
 		return nil, fmt.Errorf("APP_HASH is required when APP_ID is set")
+	}
+	if len(cfg.AdminIDs) == 0 {
+		return nil, fmt.Errorf("ADMIN_IDS is required and must contain at least one Telegram user ID")
 	}
 
 	return cfg, nil

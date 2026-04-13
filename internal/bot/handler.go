@@ -22,13 +22,14 @@ import (
 )
 
 type Handler struct {
-	cfg      *config.Config
-	bot      *tgbotapi.BotAPI
-	store    storage.KVStore
-	state    *UserStateStore
-	mtp      *mtproto.Pool
-	search   *search.Service
-	geocoder *maps.Geocoder
+	cfg       *config.Config
+	bot       *tgbotapi.BotAPI
+	store     storage.KVStore
+	state     *UserStateStore
+	mtp       *mtproto.Pool
+	search    *search.Service
+	geocoder  *maps.Geocoder
+	updateSem *semaphore.Weighted
 
 	wg sync.WaitGroup
 
@@ -67,6 +68,7 @@ func NewHandler(cfg *config.Config, botAPI *tgbotapi.BotAPI, redis storage.KVSto
 		mtp:           mtp,
 		search:        searchSvc,
 		geocoder:      maps.NewGeocoder(),
+		updateSem:     semaphore.NewWeighted(cfg.UpdateMaxParallel),
 		searchSems:    make(map[int64]*semaphore.Weighted),
 		searchCancel:  make(map[int64]context.CancelFunc),
 		lastSearchRun: make(map[int64]time.Time),
@@ -74,33 +76,33 @@ func NewHandler(cfg *config.Config, botAPI *tgbotapi.BotAPI, redis storage.KVSto
 }
 
 func (h *Handler) ProcessUpdate(ctx context.Context, upd tgbotapi.Update) {
-	if upd.CallbackQuery != nil {
-		h.wg.Add(1)
-		go func() {
-			defer h.wg.Done()
-			defer func() {
-				if rec := recover(); rec != nil {
-					log.Printf("panic recovered in callback handler: %v", rec)
-				}
-			}()
-			h.handleCallback(ctx, upd.CallbackQuery)
-		}()
+	if upd.CallbackQuery == nil && upd.Message == nil {
 		return
 	}
-	if upd.Message == nil {
+
+	if err := h.updateSem.Acquire(ctx, 1); err != nil {
+		log.Printf("skip update: %v", err)
 		return
 	}
 
 	h.wg.Add(1)
-	go func(msg *tgbotapi.Message) {
+	go func(update tgbotapi.Update) {
 		defer h.wg.Done()
+		defer h.updateSem.Release(1)
 		defer func() {
 			if rec := recover(); rec != nil {
-				log.Printf("panic recovered in message handler: %v", rec)
+				log.Printf("panic recovered in update handler: %v", rec)
 			}
 		}()
-		h.handleMessage(ctx, msg)
-	}(upd.Message)
+
+		if update.CallbackQuery != nil {
+			h.handleCallback(ctx, update.CallbackQuery)
+			return
+		}
+		if update.Message != nil {
+			h.handleMessage(ctx, update.Message)
+		}
+	}(upd)
 }
 
 func (h *Handler) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
@@ -470,7 +472,7 @@ func (h *Handler) isAdmin(userID int64) bool {
 			return true
 		}
 	}
-	return len(h.cfg.AdminIDs) == 0
+	return false
 }
 
 func (h *Handler) userSearchSemaphore(userID int64) *semaphore.Weighted {
